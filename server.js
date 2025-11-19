@@ -1,116 +1,179 @@
-const express = require("express");
-const cors = require("cors");
-const http = require("http");
-const { Server } = require("socket.io");
+// ----------------------
+// Mafia Game Server
+// ----------------------
+
+import express from "express";
+import http from "http";
+import { Server } from "socket.io";
+import cors from "cors";
+import fetch from "node-fetch";
 
 const app = express();
 app.use(cors());
+app.get("/", (req, res) => {
+  res.send("Mafia Server Running");
+});
 
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
     origin: "*",
+    methods: ["GET", "POST"]
   }
 });
 
-// Render uses process.env.PORT
-const PORT = process.env.PORT || 10000;
+// ----------------------
+// Game State
+// ----------------------
+const rooms = {}; // roomCode → { players: [], roles: {}, settings: {}, status: "" }
+const NIGHT_DURATION = 30000;
+const VOTE_DURATION = 120000;
 
-// Stores all lobbies
-let lobbies = {};
-
-// Random 6-letter code
-function generateCode() {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  let result = "";
-  for (let i = 0; i < 6; i++) {
-    result += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return result;
+// ----------------------
+// Utility – Generate Room Code
+// ----------------------
+function generateRoomCode() {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
+// ----------------------
+// Socket.IO Logic
+// ----------------------
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
 
-  // Host creates a lobby
-  socket.on("createLobby", ({ username, mafiaCount }) => {
-    const code = generateCode();
+  // Create Room
+  socket.on("createRoom", ({ username, mafiaCount }) => {
+    const roomCode = generateRoomCode();
 
-    lobbies[code] = {
-      host: socket.id,
-      users: {},
-      mafiaCount: mafiaCount,
-      gameStarted: false,
+    rooms[roomCode] = {
+      players: [{ id: socket.id, username, alive: true }],
+      roles: {},
+      mafiaCount,
+      status: "waiting"
     };
 
-    lobbies[code].users[socket.id] = {
-      username,
-      role: null,
-      alive: true,
-    };
-
-    socket.join(code);
-    socket.emit("lobbyCreated", code);
-    io.to(code).emit("lobbyUpdate", lobbies[code]);
+    socket.join(roomCode);
+    socket.emit("roomCreated", { roomCode, players: rooms[roomCode].players });
+    io.to(roomCode).emit("updatePlayers", rooms[roomCode].players);
   });
 
-  // Join a lobby
-  socket.on("joinLobby", ({ username, code }) => {
-    if (!lobbies[code]) {
-      socket.emit("errorMessage", "Lobby not found");
+
+  // Join Room
+  socket.on("joinRoom", ({ roomCode, username }) => {
+    if (!rooms[roomCode]) {
+      socket.emit("errorMessage", "Invalid room code.");
       return;
     }
 
-    lobbies[code].users[socket.id] = {
-      username,
-      role: null,
-      alive: true,
-    };
+    rooms[roomCode].players.push({ id: socket.id, username, alive: true });
+    socket.join(roomCode);
 
-    socket.join(code);
-    io.to(code).emit("lobbyUpdate", lobbies[code]);
+    io.to(roomCode).emit("updatePlayers", rooms[roomCode].players);
+    socket.emit("joinedRoom", { roomCode, players: rooms[roomCode].players });
   });
 
-  // Start the game (assign roles)
-  socket.on("startGame", (code) => {
-    if (!lobbies[code]) return;
 
-    let players = Object.keys(lobbies[code].users);
-    let mafiaCount = lobbies[code].mafiaCount;
+  // Start Game
+  socket.on("startGame", (roomCode) => {
+    const room = rooms[roomCode];
+    if (!room) return;
 
-    let roles = [];
+    const players = room.players;
 
-    for (let i = 0; i < mafiaCount; i++) roles.push("mafia");
-    roles.push("medic");
-    roles.push("detective");
+    // ROLE ASSIGNMENT
+    const shuffled = [...players].sort(() => Math.random() - 0.5);
+    const roles = {};
+    let index = 0;
 
-    while (roles.length < players.length) roles.push("villager");
+    // Mafia
+    for (let i = 0; i < room.mafiaCount; i++) {
+      roles[shuffled[index].id] = "mafia";
+      index++;
+    }
 
-    // Shuffle roles
-    roles.sort(() => Math.random() - 0.5);
+    // Medic
+    roles[shuffled[index].id] = "medic";
+    index++;
 
-    players.forEach((id, index) => {
-      lobbies[code].users[id].role = roles[index];
-      io.to(id).emit("yourRole", roles[index]); // Secret role reveal
-    });
+    // Detective
+    roles[shuffled[index].id] = "detective";
+    index++;
 
-    lobbies[code].gameStarted = true;
-    io.to(code).emit("gameStarted");
+    // Villagers
+    for (let i = index; i < shuffled.length; i++) {
+      roles[shuffled[i].id] = "villager";
+    }
+
+    room.roles = roles;
+    room.status = "night";
+
+    // Send Everyone Their Role
+    for (let id in roles) {
+      io.to(id).emit("yourRole", roles[id]);
+    }
+
+    io.to(roomCode).emit("nightStart");
   });
 
-  // Disconnect handling
+
+  // Mafia Choice
+  socket.on("mafiaChoose", ({ roomCode, target }) => {
+    const room = rooms[roomCode];
+    if (!room) return;
+
+    room.mafiaTarget = target;
+    io.to(roomCode).emit("mafiaDone");
+  });
+
+
+  // Medic Choice
+  socket.on("medicChoose", ({ roomCode, target }) => {
+    const room = rooms[roomCode];
+    if (!room) return;
+
+    room.medicSave = target;
+    io.to(roomCode).emit("medicDone");
+  });
+
+
+  // Detective Choice
+  socket.on("detectiveChoose", ({ roomCode, target }) => {
+    const room = rooms[roomCode];
+    if (!room) return;
+
+    room.detectiveTarget = target;
+    io.to(roomCode).emit("detectiveDone");
+  });
+
+
+  // Chat
+  socket.on("chatMessage", ({ roomCode, username, message }) => {
+    io.to(roomCode).emit("chatMessage", { username, message });
+  });
+
+
+  // Disconnect
   socket.on("disconnect", () => {
-    console.log("User disconnected:", socket.id);
-
-    for (const code in lobbies) {
-      if (lobbies[code].users[socket.id]) {
-        delete lobbies[code].users[socket.id];
-        io.to(code).emit("lobbyUpdate", lobbies[code]);
-      }
+    for (const roomCode in rooms) {
+      rooms[roomCode].players = rooms[roomCode].players.filter(p => p.id !== socket.id);
+      io.to(roomCode).emit("updatePlayers", rooms[roomCode].players);
     }
   });
 });
 
+
+// ----------------------
+// Keep Render Awake
+// ----------------------
+setInterval(() => {
+  fetch("https://mafia-server-snwd.onrender.com").catch(() => {});
+}, 300000);
+
+
+// ----------------------
+// Start Server
+// ----------------------
+const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
   console.log("Server running on port " + PORT);
 });
